@@ -129,14 +129,15 @@ defmodule Piplates.DAQC2 do
     status
   end
 
-  def wait_for_frame_unlocked(address, loop \\ 0) do
+  def wait_for_frame_unlocked(address, start_time \\ :os.system_time(:millisecond),  loop \\ 0) do
 
     if frame_lock_status(address) === 0 do
       frame_lock(0)
       true
     else
-      if loop < 10000 do
-        wait_for_frame_unlocked(address, loop + 1)
+      #if loop < 10000 do
+      if (:os.system_time(:millisecond) - start_time) < 500 do
+        wait_for_frame_unlocked(address, start_time, loop + 1)
       else
         false
       end
@@ -171,17 +172,17 @@ defmodule Piplates.DAQC2 do
 
   end
 
-  def wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ 0, loop \\ 1, fails \\ 0) do
+  def wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ :os.system_time(:millisecond), loop \\ 1, fails \\ 0) do
 
     if Circuits.GPIO.read(pp_ack_gpio) === 0 do
       true
     else
-      #if (:os.system_time(:millisecond) - start_time) < 8 do
-      if loop < 10000  do
+      if (:os.system_time(:millisecond) - start_time) < 5 do
+      #if loop < 10000  do
         wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1, fails)
       else
         if fails < 10 do
-          wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, 0, loop + 1, fails + 1)
+          wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, :os.system_time(:millisecond), loop + 1, fails + 1)
         else
           false
         end
@@ -190,22 +191,19 @@ defmodule Piplates.DAQC2 do
 
   end
 
-  def wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ 0, loop \\ 0, fails \\ 0) do
+  def wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ :os.system_time(:millisecond), loop \\ 0) do
 
     if Circuits.GPIO.read(pp_frame_gpio) === 0
-        && Circuits.GPIO.read(pp_ack_gpio) !== 0
+        && Circuits.GPIO.read(pp_ack_gpio) === 1
       do
+      frame_lock(0)
       true
     else
-      #if (:os.system_time(:millisecond) - start_time) < 100 do
-      if loop < 10000 do
-        wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1, fails)
+      if (:os.system_time(:millisecond) - start_time) < 500 do
+      #if loop < 10000 do
+        wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1)
       else
-        if fails < 100 do
-          wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, 0, loop + 1, fails + 1)
-        else
-          false
-        end
+        false
       end
     end
 
@@ -232,7 +230,11 @@ defmodule Piplates.DAQC2 do
       #set the frame high
       Circuits.GPIO.write(pp_frame_gpio, 1)
 
+      time = :os.system_time(:millisecond)
+
       #send the frame
+      #IO.puts("CMD sent #{cmd} #{param1} #{param2} (frame_ready=#{frame_ready} time=#{time})")
+      #Process.sleep(10)
       Circuits.SPI.transfer(spi, <<real_address, cmd, param1, param2>>)
 
       #wait for ACK to CMD
@@ -241,7 +243,8 @@ defmodule Piplates.DAQC2 do
       #wait for ACK to DATA if required
       ack_data = if ack_cmd === true and bytes > 0 do
         #wait for ACK to DATA
-        wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address)
+        true
+        #wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address)
       else
         nil
       end
@@ -258,13 +261,24 @@ defmodule Piplates.DAQC2 do
 
         #response
         Circuits.GPIO.write(pp_frame_gpio, 0)
+        #Process.sleep(10)
+        error_time = :os.system_time(:millisecond)
+        duration = error_time - time
+        #:ets.info(:daqc2_lock) |> IO.inspect
+        #IO.puts("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data} time=#{time} error_time=#{error_time} duration=#{duration})")
+        #IO.inspect(response)
         frame_unlock(address)
-        raise("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data}})")
+        raise("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data} time=#{time} error_time=#{error_time} duration=#{duration})")
 
       else
 
         Circuits.GPIO.write(pp_frame_gpio, 0)
+        #Process.sleep(10)
         frame_unlock(address)
+        #error_time = :os.system_time(:millisecond)
+        #duration = error_time - time
+        #IO.puts("FRAME UNLOCK for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data} time=#{time} error_time=#{error_time} duration=#{duration})")
+        #IO.inspect(response)
         response
 
       end
