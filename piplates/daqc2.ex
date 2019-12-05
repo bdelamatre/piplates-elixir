@@ -109,6 +109,41 @@ defmodule Piplates.DAQC2 do
 
   end
 
+  def frame_lock_init_table(address) do
+    if :ets.whereis(:daqc2_lock) == :undefined do
+      :ets.new(:daqc2_lock, [:named_table, :public])
+    end
+  end
+
+  def frame_lock(address) do
+    :ets.insert(:daqc2_lock, {"address-#{address}", 1})
+  end
+
+  def frame_unlock(address) do
+    :ets.insert(:daqc2_lock, {"address-#{address}", 0})
+  end
+
+  def frame_lock_status(address) do
+    lookup = :ets.lookup(:daqc2_lock, "address-#{address}")
+    {name,status} = Enum.at(lookup,0)
+    status
+  end
+
+  def wait_for_frame_unlocked(address, loop \\ 0) do
+
+    if frame_lock_status(address) === 0 do
+      frame_lock(0)
+      true
+    else
+      if loop < 10000 do
+        wait_for_frame_unlocked(address, loop + 1)
+      else
+        false
+      end
+    end
+    #true
+  end
+
   def get_calibration_values_from_registry(address) do
 
     lookup = :ets.lookup(:daqc2_registry, "calibration-#{address}")
@@ -142,7 +177,7 @@ defmodule Piplates.DAQC2 do
       true
     else
       #if (:os.system_time(:millisecond) - start_time) < 8 do
-      if loop < 1000  do
+      if loop < 10000  do
         wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1, fails)
       else
         if fails < 10 do
@@ -157,7 +192,11 @@ defmodule Piplates.DAQC2 do
 
   def wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ 0, loop \\ 0, fails \\ 0) do
 
-    if Circuits.GPIO.read(pp_frame_gpio) !== 0 do
+    if Circuits.GPIO.read(pp_frame_gpio) === 0
+        && Circuits.GPIO.read(pp_ack_gpio) !== 0
+      do
+      true
+    else
       #if (:os.system_time(:millisecond) - start_time) < 100 do
       if loop < 10000 do
         wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1, fails)
@@ -168,8 +207,6 @@ defmodule Piplates.DAQC2 do
           false
         end
       end
-    else
-      true
     end
 
   end
@@ -177,7 +214,11 @@ defmodule Piplates.DAQC2 do
   def ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
               address, cmd, param1, param2, bytes) do
 
-    frame_ready = wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address)
+    frame_ready = if wait_for_frame_unlocked(address) === true do
+      wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address)
+    else
+      false
+    end
 
     if frame_ready !== true do
 
@@ -217,11 +258,13 @@ defmodule Piplates.DAQC2 do
 
         #response
         Circuits.GPIO.write(pp_frame_gpio, 0)
+        frame_unlock(address)
         raise("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data}})")
 
       else
 
         Circuits.GPIO.write(pp_frame_gpio, 0)
+        frame_unlock(address)
         response
 
       end
@@ -372,7 +415,8 @@ defmodule Piplates.DAQC2 do
 
     Process.sleep(100)
 
-    #reset(spi, pp_frame_gpio, pp_ack_gpio, address)
+    frame_lock_init_table(0)
+    frame_unlock(0)
 
     Process.sleep(100)
 
@@ -380,6 +424,8 @@ defmodule Piplates.DAQC2 do
     get_calibration_values(spi, pp_frame_gpio, pp_ack_gpio, address)
 
     Process.sleep(100)
+
+
 
     {:ok, spi, pp_frame_gpio, pp_int_gpio, pp_ack_gpio}
 
