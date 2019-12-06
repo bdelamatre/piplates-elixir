@@ -4,10 +4,46 @@ defmodule Piplates.DAQC2 do
   # for more information on OTP Applications
   @moduledoc false
 
+  use GenServer
   use Bitwise
 
   alias Circuits.I2C
   alias Circuits.SPI
+
+   def start_link(arguments) do
+    GenServer.start_link(__MODULE__, arguments, name: :piplates_daqc2)
+  end
+
+  @impl true
+  def init(arguments) do
+
+    pp_frame = 25 #25 #22
+    pp_int = 22 #22 #15
+    pp_ack = 23 #23 #16
+
+    {:ok, pp_frame_gpio}  = Circuits.GPIO.open(pp_frame, :output)
+    Circuits.GPIO.write(pp_frame_gpio, 0)
+
+    Process.sleep(100)
+
+    {:ok, pp_int_gpio} = Circuits.GPIO.open(pp_int, :input)
+    Circuits.GPIO.set_pull_mode(pp_int_gpio, :pullup)
+
+    {:ok, pp_ack_gpio} = Circuits.GPIO.open(pp_ack, :input)
+    Circuits.GPIO.set_pull_mode(pp_ack_gpio, :pullup)
+
+    {:ok, spi} = Circuits.SPI.open("spidev0.1",[speed_hz: 500000, delay_us: 5])
+
+    Process.sleep(100)
+
+    {:ok, [
+      spi: spi,
+      pp_frame_gpio: pp_frame_gpio,
+      pp_int_gpio: pp_int_gpio,
+      pp_ack_gpio: pp_ack_gpio,
+    ]}
+
+  end
 
   def get_base_address do
     32
@@ -17,38 +53,29 @@ defmodule Piplates.DAQC2 do
     get_base_address + address
   end
 
-  def calibration_get_byte(spi, pp_frame_gpio, pp_ack_gpio,
-                            address, pointer) do
+  def calibration_get_byte(pid, address, pointer) do
 
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                      address, 0xFD, 2, pointer, 1)
-
-    response |> :binary.first
+    ppcmd(pid, {address, 0xFD, 2, pointer, 1}) |> :binary.first
 
   end
 
-  def calibration_put_byte(spi, pp_frame_gpio, pp_ack_gpio,
-                            address, data) do
+  def calibration_put_byte(pid, address, data) do
 
     if data < 0 or data > 255 do
       raise "Calibration value is out of range. Must be in the range of 0 to 255"
     end
 
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                      address, 0xFD, 1, data, 0)
+    ppcmd(pid, {address, 0xFD, 1, data, 0})
 
   end
 
-  def calibration_erase_block(spi, pp_frame_gpio, pp_ack_gpio,
-                                address) do
+  def calibration_erase_block(pid, address) do
 
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                  address, 0xFD, 0, 0, 0)
+    ppcmd(pid, {address, 0xFD, 0, 0, 0})
 
   end
 
-  def get_calibration_values(spi, pp_frame_gpio, pp_ack_gpio,
-                                address) do
+  def get_calibration_values(pid, address) do
 
     #build enum of 8 calibrations
     calibration = Enum.map(0..7, fn i ->
@@ -56,8 +83,7 @@ defmodule Piplates.DAQC2 do
       #get 8 values for each calibration
       values = Enum.map(0..5, fn j ->
 
-          calibration_get_byte(spi, pp_frame_gpio, pp_ack_gpio,
-                                address, 6 * i + j)
+          calibration_get_byte(pid, address, 6 * i + j)
 
       end)
 
@@ -103,49 +129,13 @@ defmodule Piplates.DAQC2 do
       :ets.new(:daqc2_registry, [:named_table, :public])
     end
 
-    :ets.insert(:daqc2_registry, {"calibration-#{address}", calibration})
+    :ets.insert(:daqc2_registry, {"calibration-0", calibration})
 
     calibration
 
   end
 
-  def frame_lock_init_table(address) do
-    if :ets.whereis(:daqc2_lock) == :undefined do
-      :ets.new(:daqc2_lock, [:named_table, :public])
-    end
-  end
-
-  def frame_lock(address) do
-    :ets.insert(:daqc2_lock, {"address-#{address}", 1})
-  end
-
-  def frame_unlock(address) do
-    :ets.insert(:daqc2_lock, {"address-#{address}", 0})
-  end
-
-  def frame_lock_status(address) do
-    lookup = :ets.lookup(:daqc2_lock, "address-#{address}")
-    {name,status} = Enum.at(lookup,0)
-    status
-  end
-
-  def wait_for_frame_unlocked(address, start_time \\ :os.system_time(:millisecond),  loop \\ 0) do
-
-    if frame_lock_status(address) === 0 do
-      frame_lock(0)
-      true
-    else
-      #if loop < 10000 do
-      if (:os.system_time(:millisecond) - start_time) < 500 do
-        wait_for_frame_unlocked(address, start_time, loop + 1)
-      else
-        false
-      end
-    end
-    #true
-  end
-
-  def get_calibration_values_from_registry(address) do
+  def get_calibration_values_from_registry(pid, address) do
 
     lookup = :ets.lookup(:daqc2_registry, "calibration-#{address}")
 
@@ -158,34 +148,26 @@ defmodule Piplates.DAQC2 do
   def read_spi(spi, max_count \\ 25, response \\ <<>>, count \\ 0) do
 
     #send dummy request to SPI just to get the next response
-    {:ok, current_response} = Circuits.SPI.transfer(spi, <<00>>)
+    {:ok, current_response} = Circuits.SPI.transfer(spi, <<0>>)
 
-    #only request and return the number of bits requested
-    #note, we are requesting +1 bits more than needed...python is returning +2?
+    #only request and return the number of bits requested + 1
     if count < max_count do
-      #loop after concatenating response and incrementing loop count
       read_spi(spi, max_count, response <> current_response, count + 1)
     else
-      #once complete, return the final response
       response <> current_response
     end
 
   end
 
-  def wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ :os.system_time(:millisecond), loop \\ 1, fails \\ 0) do
+  def wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time \\ :os.system_time(:millisecond), loop \\ 1) do
 
     if Circuits.GPIO.read(pp_ack_gpio) === 0 do
       true
     else
-      if (:os.system_time(:millisecond) - start_time) < 5 do
-      #if loop < 10000  do
-        wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1, fails)
+      if (:os.system_time(:millisecond) - start_time) < 50 do
+        wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1)
       else
-        if fails < 10 do
-          wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address, :os.system_time(:millisecond), loop + 1, fails + 1)
-        else
-          false
-        end
+        false
       end
     end
 
@@ -196,11 +178,9 @@ defmodule Piplates.DAQC2 do
     if Circuits.GPIO.read(pp_frame_gpio) === 0
         && Circuits.GPIO.read(pp_ack_gpio) === 1
       do
-      frame_lock(0)
       true
     else
       if (:os.system_time(:millisecond) - start_time) < 500 do
-      #if loop < 10000 do
         wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address, start_time, loop + 1)
       else
         false
@@ -209,19 +189,22 @@ defmodule Piplates.DAQC2 do
 
   end
 
-  def ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-              address, cmd, param1, param2, bytes) do
+  def ppcmd(pid, {address, cmd, param1, param2, bytes}) do
+    GenServer.call(pid, {:ppcmd, address, cmd, param1, param2, bytes})
+  end
 
-    frame_ready = if wait_for_frame_unlocked(address) === true do
-      wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address)
-    else
-      false
-    end
+  def handle_call({:ppcmd, address, cmd, param1, param2, bytes}, _from, arguments) do
+
+    #fetch state from init
+    spi           = Keyword.fetch!(arguments, :spi)
+    pp_frame_gpio = Keyword.fetch!(arguments, :pp_frame_gpio)
+    pp_ack_gpio   = Keyword.fetch!(arguments, :pp_ack_gpio)
+
+    frame_ready =  wait_for_frame_ready(spi, pp_frame_gpio, pp_ack_gpio, address)
 
     if frame_ready !== true do
-
+      IO.puts("FRAME timeout for #{cmd} #{param1} #{param2}")
       raise("FRAME timeout for #{cmd} #{param1} #{param2}")
-
     else
 
       #get address
@@ -230,11 +213,7 @@ defmodule Piplates.DAQC2 do
       #set the frame high
       Circuits.GPIO.write(pp_frame_gpio, 1)
 
-      time = :os.system_time(:millisecond)
-
       #send the frame
-      #IO.puts("CMD sent #{cmd} #{param1} #{param2} (frame_ready=#{frame_ready} time=#{time})")
-      #Process.sleep(10)
       Circuits.SPI.transfer(spi, <<real_address, cmd, param1, param2>>)
 
       #wait for ACK to CMD
@@ -242,9 +221,7 @@ defmodule Piplates.DAQC2 do
 
       #wait for ACK to DATA if required
       ack_data = if ack_cmd === true and bytes > 0 do
-        #wait for ACK to DATA
         true
-        #wait_for_ack(spi, pp_frame_gpio, pp_ack_gpio, address)
       else
         nil
       end
@@ -258,234 +235,90 @@ defmodule Piplates.DAQC2 do
 
       #set the the frame low
       if ack_cmd === false or ack_data === false do
-
-        #response
         Circuits.GPIO.write(pp_frame_gpio, 0)
-        #Process.sleep(10)
-        error_time = :os.system_time(:millisecond)
-        duration = error_time - time
-        #:ets.info(:daqc2_lock) |> IO.inspect
-        #IO.puts("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data} time=#{time} error_time=#{error_time} duration=#{duration})")
-        #IO.inspect(response)
-        frame_unlock(address)
-        raise("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data} time=#{time} error_time=#{error_time} duration=#{duration})")
-
+        IO.puts("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data})")
+        raise("ACK timeout for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data})")
       else
-
         Circuits.GPIO.write(pp_frame_gpio, 0)
-        #Process.sleep(10)
-        frame_unlock(address)
-        #error_time = :os.system_time(:millisecond)
-        #duration = error_time - time
-        #IO.puts("FRAME UNLOCK for #{cmd} #{param1} #{param2} (ack_cmd=#{ack_cmd} ack_data=#{ack_data} time=#{time} error_time=#{error_time} duration=#{duration})")
-        #IO.inspect(response)
-        response
-
+        {:reply, response, arguments}
       end
 
     end
 
   end
 
-  def getADCall(spi, pp_frame_gpio, pp_ack_gpio,
-                  address) do
+  def getADCall(pid, address) do
 
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x31, 0, 0, 16)
+    response = ppcmd(pid,{address, 0x31, 0, 0, 16})
 
-    if response === nil do
-      nil
-    else
+    response_chunked = response |> :binary.bin_to_list |> Enum.chunk_every(2)
 
-      response_list = response |> :binary.bin_to_list
+    calibration = get_calibration_values_from_registry(pid, address)
 
-      response_chunked = Enum.chunk_every(response_list, 2)
+    Enum.map(Enum.with_index(response_chunked), fn {chunk, index} ->
 
-      calibration = get_calibration_values_from_registry(address)
+        {scale, offset, dac} = Enum.at(calibration, index)
 
-      adc_values = Enum.map(Enum.with_index(response_chunked), fn {chunk, index} ->
+        #combine chunks
+        calc1 = 256 * Enum.at(chunk, 0) + Enum.at(chunk, 1)
+        calc2 = (calc1 * 24.0 / 65536) - 12.0
+        #calibrate value
+        calc3 = calc2 * scale + offset
 
-          {scale, offset, dac} = Enum.at(calibration, index)
+        calc3
 
-          #combine chunks
-          calc1 = 256 * Enum.at(chunk, 0) + Enum.at(chunk, 1)
-          calc2 = (calc1 * 24.0 / 65536) - 12.0
-          #calibrate value
-          calc3 = calc2 * scale + offset
+    end)
 
-          calc3
-
-      end)
-
-    end
 
   end
 
-  def getADC(spi, pp_frame_gpio, pp_ack_gpio,
-                  address, channel) do
+  def getADC(pid, address, channel) do
 
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x30, channel, 0, 2)
-    if response === nil do
-      nil
-    else
+    response = ppcmd(pid, {address, 0x30, channel, 0, 2})
 
-      chunk = response |> :binary.bin_to_list |> Enum.chunk_every(2) |> Enum.at(0)
+    response_chunked = response |> :binary.bin_to_list |> Enum.chunk_every(2) |> Enum.at(0)
 
-      calibration = get_calibration_values_from_registry(address)
+    calibration = get_calibration_values_from_registry(pid, address)
 
-      {scale, offset, dac} = Enum.at(calibration,channel)
+    {scale, offset, dac} = Enum.at(calibration, channel)
 
-      #combine chunks
-      calc1 = 256 * Enum.at(chunk, 0) + Enum.at(chunk, 1)
-      calc2 = (calc1 * 24.0 / 65536) - 12.0
-      #calibrate value
-      calc3 = calc2 * scale + offset
+    #combine chunks
+    calc1 = 256 * Enum.at(response_chunked, 0) + Enum.at(response_chunked, 1)
+    calc2 = (calc1 * 24.0 / 65536) - 12.0
+    #calibrate value
+    calc3 = calc2 * scale + offset
 
-      calc3
-
-    end
+    calc3
 
   end
 
   #def setDOUTall(addr,byte):
-  def setDOUTall(spi, pp_frame_gpio, pp_ack_gpio,
-                  address, byte) do
-
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x13, byte, 0, 0)
-
+  def setDOUTall(pid, address, byte) do
+    ppcmd(pid, {address, 0x13, byte, 0, 0})
   end
 
-  def setDOUTbit(spi, pp_frame_gpio, pp_ack_gpio,
-                  address, bit) do
-
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x10, bit, 0, 0)
-
+  def setDOUTbit(pid, address, bit) do
+    ppcmd(pid, {address, 0x10, bit, 0, 0})
   end
 
-  def clrDOUTbit(spi, pp_frame_gpio, pp_ack_gpio,
-                  address, bit) do
-
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x11, bit, 0, 0)
-
+  def clrDOUTbit(pid, address, bit) do
+    ppcmd(pid, {address, 0x11, bit, 0, 0})
   end
 
-  def getDINbit(spi, pp_frame_gpio, pp_ack_gpio,
-                  address, bit) do
+  def getDINbit(pid, address, bit) do
 
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x20, bit, 0, 1)
+    value = ppcmd(pid, {address, 0x20, bit, 0, 1}) |> :binary.bin_to_list |> Enum.at(0)
 
-    if response === nil do
-      nil
+    if value > 0 do
+      1
     else
-
-      value = response |> :binary.bin_to_list |> Enum.at(0)
-
-      if value > 0 do
-        1
-      else
-        0
-      end
-
+      0
     end
 
   end
 
-
-  def reset(spi, pp_frame_gpio, pp_ack_gpio,
-                  address) do
-
-    response = ppcmd(spi, pp_frame_gpio, pp_ack_gpio,
-                        address, 0x0F, 0, 0, 0)
-
-  end
-
-  def close(address) do
-
-  end
-
-  def init(address) do
-
-    pp_frame = 25 #25 #22
-    pp_int = 22 #22 #15
-    pp_ack = 23 #23 #16
-
-    {:ok, pp_frame_gpio}  = Circuits.GPIO.open(pp_frame, :output)
-    Circuits.GPIO.write(pp_frame_gpio, 0)
-
-    Process.sleep(100)
-
-    {:ok, pp_int_gpio} = Circuits.GPIO.open(pp_int, :input)
-    Circuits.GPIO.set_pull_mode(pp_int_gpio, :pullup)
-
-    {:ok, pp_ack_gpio} = Circuits.GPIO.open(pp_ack, :input)
-    Circuits.GPIO.set_pull_mode(pp_ack_gpio, :pullup)
-
-    {:ok, spi} = Circuits.SPI.open("spidev0.1",[speed_hz: 500000, delay_us: 5])
-
-    Process.sleep(100)
-
-    frame_lock_init_table(0)
-    frame_unlock(0)
-
-    Process.sleep(100)
-
-    #get calibration values for address
-    get_calibration_values(spi, pp_frame_gpio, pp_ack_gpio, address)
-
-    Process.sleep(100)
-
-
-
-    {:ok, spi, pp_frame_gpio, pp_int_gpio, pp_ack_gpio}
-
-  end
-
-  def test do
-
-
-    address = 0
-
-    {:ok, spi, pp_frame_gpio, pp_int_gpio, pp_ack_gpio} = init(address)
-
-    get_calibration_values_from_registry(address) |> IO.inspect()
-
-    getADCall(spi, pp_frame_gpio, pp_ack_gpio,
-                          address) |> IO.inspect
-
-
-    getADC(spi, pp_frame_gpio, pp_ack_gpio,
-                          address, 2) |> IO.inspect
-
-    setDOUTall(spi, pp_frame_gpio, pp_ack_gpio,
-                          address, 255) |> IO.inspect
-
-    Process.sleep(2000)
-
-    setDOUTall(spi, pp_frame_gpio, pp_ack_gpio,
-                          address, 0) |> IO.inspect
-
-    Process.sleep(2000)
-
-    setDOUTbit(spi, pp_frame_gpio, pp_ack_gpio,
-                          address, 0) |> IO.inspect
-
-    Process.sleep(2000)
-
-    clrDOUTbit(spi, pp_frame_gpio, pp_ack_gpio,
-                          address, 0) |> IO.inspect
-
-
-    #need to port to function
-    #<<revision, unknown>> = ppcmd(spi, pp_frame_gpio, pp_ack_gpio, 0x02)
-    #whole = revision >>> 4
-    #point = revision &&& 0x0F
-    #version = "#{whole}.#{point}"
-
+  def reset(pid, address) do
+    ppcmd(pid, {address, 0x0F, 0, 0, 0})
   end
 
 end
